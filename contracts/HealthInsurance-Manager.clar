@@ -173,3 +173,134 @@
 )
 
 
+(define-data-var base-premium-rate uint u10)
+(define-data-var age-factor uint u2)
+
+(define-public (calculate-premium (age uint) (coverage-amount uint))
+    (let
+        (
+            (base-amount (var-get base-premium-rate))
+            (age-multiplier (* (var-get age-factor) age))
+            (coverage-factor (/ coverage-amount u1000))
+            (total-premium (+ (* base-amount coverage-factor) age-multiplier))
+        )
+        (ok total-premium)
+    )
+)
+
+
+
+(define-public (renew-policy (duration uint))
+    (let
+        (
+            (policy (unwrap! (map-get? Policies tx-sender) ERR-POLICY-NOT-FOUND))
+            (current-time stacks-block-height)
+            (new-end-date (+ current-time duration))
+        )
+        (map-set Policies tx-sender
+            (merge policy 
+                {
+                    end-date: new-end-date,
+                    status: "active"
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+
+(define-map ClaimHistory
+    principal
+    (list 10 uint)
+)
+
+(define-public (add-to-claim-history (claim-id uint))
+    (let
+        (
+            (current-history (default-to (list ) (map-get? ClaimHistory tx-sender)))
+        )
+        (map-set ClaimHistory tx-sender (unwrap! (as-max-len? (append current-history claim-id) u10) ERR-INVALID-AMOUNT))
+        (ok true)
+    )
+)
+
+(define-read-only (get-claim-history (holder principal))
+    (map-get? ClaimHistory holder)
+)
+
+
+
+(define-map FamilyMembers
+    principal
+    (list 5 principal)
+)
+
+(define-public (add-family-member (member principal))
+    (let
+        (
+            (current-members (default-to (list ) (map-get? FamilyMembers tx-sender)))
+        )
+        (map-set FamilyMembers tx-sender (unwrap! (as-max-len? (append current-members member) u5) ERR-INVALID-AMOUNT))
+        (ok true)
+    )
+)
+
+(define-read-only (get-family-members (holder principal))
+    (map-get? FamilyMembers holder)
+)
+
+
+(define-map CoverageTypes
+    uint
+    {
+        name: (string-ascii 20),
+        percentage: uint,
+        max-limit: uint
+    }
+)
+
+(define-public (add-coverage-type (type-id uint) (name (string-ascii 20)) (percentage uint) (max-limit uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (map-set CoverageTypes type-id
+            {
+                name: name,
+                percentage: percentage,
+                max-limit: max-limit
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-coverage-type (type-id uint))
+    (map-get? CoverageTypes type-id)
+)
+
+
+(define-public (suspend-policy (holder principal))
+    (let
+        (
+            (policy (unwrap! (map-get? Policies holder) ERR-POLICY-NOT-FOUND))
+        )
+        (begin
+            (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+            (map-set Policies holder
+                (merge policy 
+                    {
+                        status: "suspended"
+                    }
+                )
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (is-policy-suspended (holder principal))
+    (match (map-get? Policies holder)
+        policy (is-eq (get status policy) "suspended")
+        false
+    )
+)
