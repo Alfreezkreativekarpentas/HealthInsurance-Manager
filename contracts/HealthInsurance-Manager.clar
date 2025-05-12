@@ -398,3 +398,48 @@
         (ok claim-id)
     )
 )
+
+
+(define-public (update-insurance-token-price (new-price uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set insurance-token-price new-price)
+        (ok true)
+    )
+)
+(define-read-only (get-insurance-token-price)
+    (var-get insurance-token-price)
+)
+(define-read-only (get-base-premium-rate)
+    (var-get base-premium-rate)
+)
+(define-public (update-base-premium-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set base-premium-rate new-rate)
+        (ok true)
+    )
+)
+(define-public (update-age-factor (new-factor uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set age-factor new-factor)
+        (ok true)
+    )
+)
+(define-public (toggle-discount-enabled)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set discount-enabled (not (var-get discount-enabled)))
+        (ok true)
+    )
+)
+
+(define-public (get-claim-status (claim-id uint))
+    (let
+        (
+            (claim (unwrap! (map-get? Claims claim-id) ERR-CLAIM-NOT-FOUND))
+        )
+        (ok (get status claim))
+    )
+)
