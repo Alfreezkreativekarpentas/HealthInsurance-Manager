@@ -304,3 +304,97 @@
         false
     )
 )
+
+
+
+(define-map DiscountTiers
+    uint
+    {
+        claims-threshold: uint,
+        discount-percentage: uint
+    }
+)
+
+(define-data-var discount-enabled bool true)
+
+(define-public (set-discount-tier (tier-id uint) (claims-threshold uint) (discount-percentage uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (map-set DiscountTiers tier-id
+            {
+                claims-threshold: claims-threshold,
+                discount-percentage: discount-percentage
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (calculate-discounted-premium (holder principal) (base-premium uint))
+    (let
+        (
+            (claim-count (len (default-to (list) (map-get? ClaimHistory holder))))
+            (tier-1 (unwrap! (map-get? DiscountTiers u1) (ok base-premium)))
+            (tier-2 (unwrap! (map-get? DiscountTiers u2) (ok base-premium)))
+        )
+        (if (not (var-get discount-enabled))
+            (ok base-premium)
+            (if (<= claim-count (get claims-threshold tier-1))
+                (ok (/ (* base-premium (- u100 (get discount-percentage tier-1))) u100))
+                (if (<= claim-count (get claims-threshold tier-2))
+                    (ok (/ (* base-premium (- u100 (get discount-percentage tier-2))) u100))
+                    (ok base-premium)
+                )
+            )
+        )
+    )
+)
+
+
+(define-map EmergencyContacts
+    principal
+    {
+        contact: principal,
+        relationship: (string-ascii 20),
+        authorized: bool
+    }
+)
+
+(define-public (set-emergency-contact (contact principal) (relationship (string-ascii 20)))
+    (begin
+        (asserts! (is-some (map-get? Policies tx-sender)) ERR-POLICY-NOT-FOUND)
+        (map-set EmergencyContacts tx-sender
+            {
+                contact: contact,
+                relationship: relationship,
+                authorized: true
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (emergency-file-claim (policy-holder principal) (amount uint) (provider principal) (description (string-ascii 50)))
+    (let
+        (
+            (emergency-contact (unwrap! (map-get? EmergencyContacts policy-holder) ERR-NOT-AUTHORIZED))
+            (policy (unwrap! (map-get? Policies policy-holder) ERR-POLICY-NOT-FOUND))
+            (claim-id (+ (var-get total-claims) u1))
+        )
+        (asserts! (and (is-eq tx-sender (get contact emergency-contact)) (get authorized emergency-contact)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= amount (get coverage-amount policy)) ERR-INVALID-AMOUNT)
+        
+        (map-set Claims claim-id
+            {
+                policy-holder: policy-holder,
+                amount: amount,
+                provider: provider,
+                date: stacks-block-height,
+                status: "pending",
+                description: description
+            }
+        )
+        (var-set total-claims claim-id)
+        (ok claim-id)
+    )
+)
