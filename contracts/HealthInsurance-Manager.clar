@@ -12,6 +12,32 @@
 (define-constant ERR-PROVIDER-EXISTS (err u106))
 (define-constant ERR-PROVIDER-NOT-FOUND (err u107))
 
+
+
+(define-constant ERR-AUTO-APPROVAL-DISABLED (err u108))
+(define-constant ERR-INVALID-THRESHOLD (err u109))
+
+(define-data-var auto-approval-enabled bool true)
+(define-data-var auto-approval-amount-threshold uint u1000)
+(define-data-var auto-approval-claim-history-limit uint u3)
+
+(define-map TrustedProviders
+    principal
+    {
+        trust-score: uint,
+        auto-approval-eligible: bool
+    }
+)
+
+(define-map AutoApprovalStats
+    principal
+    {
+        total-auto-approved: uint,
+        total-auto-approved-amount: uint,
+        last-auto-approval: uint
+    }
+)
+
 ;; Data Variables
 (define-data-var insurance-token-price uint u100)
 (define-data-var total-policies uint u0)
@@ -441,5 +467,136 @@
             (claim (unwrap! (map-get? Claims claim-id) ERR-CLAIM-NOT-FOUND))
         )
         (ok (get status claim))
+    )
+)
+
+
+(define-public (set-provider-trust-status (provider principal) (trust-score uint) (auto-eligible bool))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some (map-get? HealthcareProviders provider)) ERR-PROVIDER-NOT-FOUND)
+        (map-set TrustedProviders provider
+            {
+                trust-score: trust-score,
+                auto-approval-eligible: auto-eligible
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (file-claim-with-auto-approval (amount uint) (provider principal) (description (string-ascii 50)))
+    (let
+        (
+            (policy (unwrap! (map-get? Policies tx-sender) ERR-POLICY-NOT-FOUND))
+            (claim-id (+ (var-get total-claims) u1))
+            (should-auto-approve (is-eligible-for-auto-approval tx-sender amount provider))
+        )
+        (asserts! (<= amount (get coverage-amount policy)) ERR-INVALID-AMOUNT)
+        (asserts! (is-some (map-get? HealthcareProviders provider)) ERR-PROVIDER-NOT-FOUND)
+        
+        (map-set Claims claim-id
+            {
+                policy-holder: tx-sender,
+                amount: amount,
+                provider: provider,
+                date: stacks-block-height,
+                status: (if should-auto-approve "approved" "pending"),
+                description: description
+            }
+        )
+        (var-set total-claims claim-id)
+        
+        (if should-auto-approve
+            (update-auto-approval-stats tx-sender amount)
+            true
+        )
+        (ok claim-id)
+    )
+)
+
+(define-private (is-eligible-for-auto-approval (holder principal) (amount uint) (provider principal))
+    (let
+        (
+            (trusted-provider (map-get? TrustedProviders provider))
+            (claim-history (default-to (list) (map-get? ClaimHistory holder)))
+            (policy (unwrap! (map-get? Policies holder) false))
+        )
+        (and
+            (var-get auto-approval-enabled)
+            (<= amount (var-get auto-approval-amount-threshold))
+            (is-eq (get status policy) "active")
+            (>= (get end-date policy) stacks-block-height)
+            (<= (len claim-history) (var-get auto-approval-claim-history-limit))
+            (match trusted-provider
+                provider-info (get auto-approval-eligible provider-info)
+                false
+            )
+        )
+    )
+)
+
+(define-private (update-auto-approval-stats (holder principal) (amount uint))
+    (let
+        (
+            (current-stats (default-to 
+                {total-auto-approved: u0, total-auto-approved-amount: u0, last-auto-approval: u0}
+                (map-get? AutoApprovalStats holder)
+            ))
+        )
+        (map-set AutoApprovalStats holder
+            {
+                total-auto-approved: (+ (get total-auto-approved current-stats) u1),
+                total-auto-approved-amount: (+ (get total-auto-approved-amount current-stats) amount),
+                last-auto-approval: stacks-block-height
+            }
+        )
+    )
+)
+
+(define-public (configure-auto-approval (enabled bool) (amount-threshold uint) (claim-history-limit uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount-threshold u0) ERR-INVALID-THRESHOLD)
+        (var-set auto-approval-enabled enabled)
+        (var-set auto-approval-amount-threshold amount-threshold)
+        (var-set auto-approval-claim-history-limit claim-history-limit)
+        (ok true)
+    )
+)
+
+(define-read-only (get-auto-approval-config)
+    {
+        enabled: (var-get auto-approval-enabled),
+        amount-threshold: (var-get auto-approval-amount-threshold),
+        claim-history-limit: (var-get auto-approval-claim-history-limit)
+    }
+)
+
+(define-read-only (get-provider-trust-status (provider principal))
+    (map-get? TrustedProviders provider)
+)
+
+(define-read-only (get-auto-approval-stats (holder principal))
+    (map-get? AutoApprovalStats holder)
+)
+
+(define-read-only (check-auto-approval-eligibility (holder principal) (amount uint) (provider principal))
+    (is-eligible-for-auto-approval holder amount provider)
+)
+
+(define-read-only (get-pending-claims-count)
+    (let
+        (
+            (total (var-get total-claims))
+        )
+        (fold count-pending-claims (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0)
+    )
+)
+
+(define-private (count-pending-claims (claim-id uint) (acc uint))
+    (match (map-get? Claims claim-id)
+        claim (if (is-eq (get status claim) "pending") (+ acc u1) acc)
+        acc
     )
 )
