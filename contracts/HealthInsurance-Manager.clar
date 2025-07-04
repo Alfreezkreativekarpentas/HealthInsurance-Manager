@@ -21,6 +21,36 @@
 (define-data-var auto-approval-amount-threshold uint u1000)
 (define-data-var auto-approval-claim-history-limit uint u3)
 
+;; Additional error constants
+(define-constant ERR-APPEAL-EXISTS (err u110))
+(define-constant ERR-APPEAL-NOT-FOUND (err u111))
+(define-constant ERR-CLAIM-NOT-REJECTED (err u112))
+(define-constant ERR-APPEAL-DEADLINE-EXPIRED (err u113))
+
+;; Data variables for appeals
+(define-data-var total-appeals uint u0)
+(define-data-var appeal-deadline-blocks uint u1440)
+
+;; Appeals data map
+(define-map Appeals
+    uint
+    {
+        claim-id: uint,
+        policy-holder: principal,
+        appeal-reason: (string-ascii 100),
+        appeal-date: uint,
+        status: (string-ascii 10),
+        review-date: uint,
+        reviewer-notes: (string-ascii 100)
+    }
+)
+
+;; Map claim ID to appeal ID for quick lookup
+(define-map ClaimAppeals
+    uint
+    uint
+)
+
 (define-map TrustedProviders
     principal
     {
@@ -597,6 +627,136 @@
 (define-private (count-pending-claims (claim-id uint) (acc uint))
     (match (map-get? Claims claim-id)
         claim (if (is-eq (get status claim) "pending") (+ acc u1) acc)
+        acc
+    )
+)
+
+;; File an appeal for a rejected claim
+(define-public (file-appeal (claim-id uint) (reason (string-ascii 100)))
+    (let
+        (
+            (claim (unwrap! (map-get? Claims claim-id) ERR-CLAIM-NOT-FOUND))
+            (appeal-id (+ (var-get total-appeals) u1))
+            (current-time stacks-block-height)
+            (appeal-deadline (+ (get date claim) (var-get appeal-deadline-blocks)))
+        )
+        (asserts! (is-eq tx-sender (get policy-holder claim)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status claim) "rejected") ERR-CLAIM-NOT-REJECTED)
+        (asserts! (is-none (map-get? ClaimAppeals claim-id)) ERR-APPEAL-EXISTS)
+        (asserts! (<= current-time appeal-deadline) ERR-APPEAL-DEADLINE-EXPIRED)
+        
+        (map-set Appeals appeal-id
+            {
+                claim-id: claim-id,
+                policy-holder: tx-sender,
+                appeal-reason: reason,
+                appeal-date: current-time,
+                status: "pending",
+                review-date: u0,
+                reviewer-notes: ""
+            }
+        )
+        (map-set ClaimAppeals claim-id appeal-id)
+        (var-set total-appeals appeal-id)
+        (ok appeal-id)
+    )
+)
+
+;; Process an appeal (only contract owner)
+(define-public (process-appeal (appeal-id uint) (approved bool) (reviewer-notes (string-ascii 100)))
+    (let
+        (
+            (appeal (unwrap! (map-get? Appeals appeal-id) ERR-APPEAL-NOT-FOUND))
+            (claim-id (get claim-id appeal))
+            (claim (unwrap! (map-get? Claims claim-id) ERR-CLAIM-NOT-FOUND))
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status appeal) "pending") ERR-NOT-AUTHORIZED)
+        
+        (map-set Appeals appeal-id
+            (merge appeal 
+                {
+                    status: (if approved "approved" "denied"),
+                    review-date: stacks-block-height,
+                    reviewer-notes: reviewer-notes
+                }
+            )
+        )
+        
+        (if approved
+            (map-set Claims claim-id
+                (merge claim {status: "approved"})
+            )
+            true
+        )
+        (ok true)
+    )
+)
+
+;; Get appeal details
+(define-read-only (get-appeal (appeal-id uint))
+    (map-get? Appeals appeal-id)
+)
+
+;; Get appeal by claim ID
+(define-read-only (get-appeal-by-claim (claim-id uint))
+    (match (map-get? ClaimAppeals claim-id)
+        appeal-id (map-get? Appeals appeal-id)
+        none
+    )
+)
+
+;; Check if claim can be appealed
+(define-read-only (can-appeal-claim (claim-id uint))
+    (match (map-get? Claims claim-id)
+        claim (let
+            (
+                (current-time stacks-block-height)
+                (appeal-deadline (+ (get date claim) (var-get appeal-deadline-blocks)))
+            )
+            (and
+                (is-eq (get status claim) "rejected")
+                (is-none (map-get? ClaimAppeals claim-id))
+                (<= current-time appeal-deadline)
+            )
+        )
+        false
+    )
+)
+
+;; Get total appeals count
+(define-read-only (get-total-appeals)
+    (var-get total-appeals)
+)
+
+;; Get appeal deadline in blocks
+(define-read-only (get-appeal-deadline-blocks)
+    (var-get appeal-deadline-blocks)
+)
+
+;; Update appeal deadline (only contract owner)
+(define-public (update-appeal-deadline (new-deadline uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-deadline u0) ERR-INVALID-AMOUNT)
+        (var-set appeal-deadline-blocks new-deadline)
+        (ok true)
+    )
+)
+
+;; Get pending appeals count
+(define-read-only (get-pending-appeals-count)
+    (let
+        (
+            (total (var-get total-appeals))
+        )
+        (fold count-pending-appeals (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0)
+    )
+)
+
+(define-private (count-pending-appeals (appeal-id uint) (acc uint))
+    (match (map-get? Appeals appeal-id)
+        appeal (if (is-eq (get status appeal) "pending") (+ acc u1) acc)
         acc
     )
 )
