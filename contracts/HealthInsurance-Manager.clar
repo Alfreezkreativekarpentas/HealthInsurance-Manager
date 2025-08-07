@@ -11,11 +11,17 @@
 (define-constant ERR-CLAIM-NOT-FOUND (err u105))
 (define-constant ERR-PROVIDER-EXISTS (err u106))
 (define-constant ERR-PROVIDER-NOT-FOUND (err u107))
+(define-constant ERR-HSA-NOT-FOUND (err u108))
+(define-constant ERR-HSA-EXISTS (err u109))
+(define-constant ERR-CONTRIBUTION-LIMIT-EXCEEDED (err u110))
+(define-constant ERR-INSUFFICIENT-HSA-BALANCE (err u111))
+(define-constant ERR-INVALID-HSA-AMOUNT (err u112))
+(define-constant ERR-HSA-NOT-ELIGIBLE (err u113))
 
 
 
-(define-constant ERR-AUTO-APPROVAL-DISABLED (err u108))
-(define-constant ERR-INVALID-THRESHOLD (err u109))
+(define-constant ERR-AUTO-APPROVAL-DISABLED (err u114))
+(define-constant ERR-INVALID-THRESHOLD (err u115))
 
 (define-data-var auto-approval-enabled bool true)
 (define-data-var auto-approval-amount-threshold uint u1000)
@@ -73,6 +79,12 @@
 (define-data-var total-policies uint u0)
 (define-data-var total-claims uint u0)
 
+;; HSA Data Variables
+(define-data-var hsa-annual-contribution-limit uint u3650)
+(define-data-var hsa-catch-up-contribution-limit uint u1000)
+(define-data-var hsa-annual-interest-rate uint u250)
+(define-data-var total-hsa-accounts uint u0)
+
 ;; Data Maps
 (define-map Policies
     principal
@@ -105,6 +117,33 @@
         joining-date: uint
     }
 )
+
+;; HSA Account Management
+(define-map HSAAccounts
+    principal
+    {
+        balance: uint,
+        annual-contributions: uint,
+        contribution-year: uint,
+        last-interest-calculation: uint,
+        account-creation-date: uint,
+        is-catch-up-eligible: bool
+    }
+)
+
+(define-map HSATransactions
+    uint
+    {
+        account-holder: principal,
+        transaction-type: (string-ascii 15),
+        amount: uint,
+        date: uint,
+        description: (string-ascii 100),
+        claim-id: (optional uint)
+    }
+)
+
+(define-data-var total-hsa-transactions uint u0)
 
 ;; Public Functions
 
@@ -631,132 +670,243 @@
     )
 )
 
-;; File an appeal for a rejected claim
-(define-public (file-appeal (claim-id uint) (reason (string-ascii 100)))
+;; HSA Functions
+
+;; Create a new HSA account
+(define-public (create-hsa-account (is-catch-up-eligible bool))
     (let
         (
-            (claim (unwrap! (map-get? Claims claim-id) ERR-CLAIM-NOT-FOUND))
-            (appeal-id (+ (var-get total-appeals) u1))
             (current-time stacks-block-height)
-            (appeal-deadline (+ (get date claim) (var-get appeal-deadline-blocks)))
         )
-        (asserts! (is-eq tx-sender (get policy-holder claim)) ERR-NOT-AUTHORIZED)
-        (asserts! (is-eq (get status claim) "rejected") ERR-CLAIM-NOT-REJECTED)
-        (asserts! (is-none (map-get? ClaimAppeals claim-id)) ERR-APPEAL-EXISTS)
-        (asserts! (<= current-time appeal-deadline) ERR-APPEAL-DEADLINE-EXPIRED)
+        (asserts! (is-some (map-get? Policies tx-sender)) ERR-POLICY-NOT-FOUND)
+        (asserts! (is-none (map-get? HSAAccounts tx-sender)) ERR-HSA-EXISTS)
         
-        (map-set Appeals appeal-id
+        (map-set HSAAccounts tx-sender
             {
-                claim-id: claim-id,
-                policy-holder: tx-sender,
-                appeal-reason: reason,
-                appeal-date: current-time,
-                status: "pending",
-                review-date: u0,
-                reviewer-notes: ""
+                balance: u0,
+                annual-contributions: u0,
+                contribution-year: current-time,
+                last-interest-calculation: current-time,
+                account-creation-date: current-time,
+                is-catch-up-eligible: is-catch-up-eligible
             }
         )
-        (map-set ClaimAppeals claim-id appeal-id)
-        (var-set total-appeals appeal-id)
-        (ok appeal-id)
+        (var-set total-hsa-accounts (+ (var-get total-hsa-accounts) u1))
+        (ok true)
     )
 )
 
-;; Process an appeal (only contract owner)
-(define-public (process-appeal (appeal-id uint) (approved bool) (reviewer-notes (string-ascii 100)))
+;; Contribute to HSA account
+(define-public (contribute-to-hsa (amount uint))
     (let
         (
-            (appeal (unwrap! (map-get? Appeals appeal-id) ERR-APPEAL-NOT-FOUND))
-            (claim-id (get claim-id appeal))
-            (claim (unwrap! (map-get? Claims claim-id) ERR-CLAIM-NOT-FOUND))
+            (hsa-account (unwrap! (map-get? HSAAccounts tx-sender) ERR-HSA-NOT-FOUND))
+            (current-time stacks-block-height)
+            (current-contributions (get annual-contributions hsa-account))
+            (base-limit (var-get hsa-annual-contribution-limit))
+            (catch-up-limit (var-get hsa-catch-up-contribution-limit))
+            (total-limit (if (get is-catch-up-eligible hsa-account) 
+                (+ base-limit catch-up-limit) 
+                base-limit))
+            (transaction-id (+ (var-get total-hsa-transactions) u1))
         )
-        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
-        (asserts! (is-eq (get status appeal) "pending") ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-HSA-AMOUNT)
+        (asserts! (<= (+ current-contributions amount) total-limit) ERR-CONTRIBUTION-LIMIT-EXCEEDED)
         
-        (map-set Appeals appeal-id
-            (merge appeal 
+        ;; Reset annual contributions if new year
+        (let
+            (
+                (updated-account (if (> (- current-time (get contribution-year hsa-account)) u52560)
+                    (merge hsa-account {annual-contributions: u0, contribution-year: current-time})
+                    hsa-account))
+            )
+            (map-set HSAAccounts tx-sender
+                (merge updated-account
+                    {
+                        balance: (+ (get balance updated-account) amount),
+                        annual-contributions: (+ (get annual-contributions updated-account) amount)
+                    }
+                )
+            )
+            
+            ;; Record transaction
+            (map-set HSATransactions transaction-id
                 {
-                    status: (if approved "approved" "denied"),
-                    review-date: stacks-block-height,
-                    reviewer-notes: reviewer-notes
+                    account-holder: tx-sender,
+                    transaction-type: "contribution",
+                    amount: amount,
+                    date: current-time,
+                    description: "HSA contribution",
+                    claim-id: none
+                }
+            )
+            (var-set total-hsa-transactions transaction-id)
+            (ok transaction-id)
+        )
+    )
+)
+
+;; Withdraw from HSA for qualified medical expenses
+(define-public (withdraw-from-hsa (amount uint) (description (string-ascii 100)) (claim-id (optional uint)))
+    (let
+        (
+            (hsa-account (unwrap! (map-get? HSAAccounts tx-sender) ERR-HSA-NOT-FOUND))
+            (current-time stacks-block-height)
+            (transaction-id (+ (var-get total-hsa-transactions) u1))
+        )
+        (asserts! (> amount u0) ERR-INVALID-HSA-AMOUNT)
+        (asserts! (>= (get balance hsa-account) amount) ERR-INSUFFICIENT-HSA-BALANCE)
+        
+        (map-set HSAAccounts tx-sender
+            (merge hsa-account
+                {
+                    balance: (- (get balance hsa-account) amount)
                 }
             )
         )
         
-        (if approved
-            (map-set Claims claim-id
-                (merge claim {status: "approved"})
-            )
-            true
+        ;; Record transaction
+        (map-set HSATransactions transaction-id
+            {
+                account-holder: tx-sender,
+                transaction-type: "withdrawal",
+                amount: amount,
+                date: current-time,
+                description: description,
+                claim-id: claim-id
+            }
         )
+        (var-set total-hsa-transactions transaction-id)
+        (ok transaction-id)
+    )
+)
+
+;; Calculate and apply interest to HSA account
+(define-public (apply-hsa-interest (account-holder principal))
+    (let
+        (
+            (hsa-account (unwrap! (map-get? HSAAccounts account-holder) ERR-HSA-NOT-FOUND))
+            (current-time stacks-block-height)
+            (time-since-last-calc (- current-time (get last-interest-calculation hsa-account)))
+            (annual-rate (var-get hsa-annual-interest-rate))
+            (interest-amount (/ (* (get balance hsa-account) annual-rate time-since-last-calc) (* u52560 u10000)))
+            (transaction-id (+ (var-get total-hsa-transactions) u1))
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> time-since-last-calc u0) ERR-INVALID-HSA-AMOUNT)
+        
+        (map-set HSAAccounts account-holder
+            (merge hsa-account
+                {
+                    balance: (+ (get balance hsa-account) interest-amount),
+                    last-interest-calculation: current-time
+                }
+            )
+        )
+        
+        ;; Record interest transaction
+        (map-set HSATransactions transaction-id
+            {
+                account-holder: account-holder,
+                transaction-type: "interest",
+                amount: interest-amount,
+                date: current-time,
+                description: "Interest payment",
+                claim-id: none
+            }
+        )
+        (var-set total-hsa-transactions transaction-id)
+        (ok interest-amount)
+    )
+)
+
+;; Pay claim using HSA funds
+(define-public (pay-claim-with-hsa (claim-id uint))
+    (let
+        (
+            (claim (unwrap! (map-get? Claims claim-id) ERR-CLAIM-NOT-FOUND))
+            (hsa-account (unwrap! (map-get? HSAAccounts tx-sender) ERR-HSA-NOT-FOUND))
+            (claim-amount (get amount claim))
+        )
+        (asserts! (is-eq tx-sender (get policy-holder claim)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status claim) "approved") ERR-NOT-AUTHORIZED)
+        (asserts! (>= (get balance hsa-account) claim-amount) ERR-INSUFFICIENT-HSA-BALANCE)
+        
+        (try! (withdraw-from-hsa claim-amount "Claim payment" (some claim-id)))
         (ok true)
     )
 )
 
-;; Get appeal details
-(define-read-only (get-appeal (appeal-id uint))
-    (map-get? Appeals appeal-id)
+;; HSA Read-only Functions
+
+;; Get HSA account details
+(define-read-only (get-hsa-account (account-holder principal))
+    (map-get? HSAAccounts account-holder)
 )
 
-;; Get appeal by claim ID
-(define-read-only (get-appeal-by-claim (claim-id uint))
-    (match (map-get? ClaimAppeals claim-id)
-        appeal-id (map-get? Appeals appeal-id)
+;; Get HSA transaction details
+(define-read-only (get-hsa-transaction (transaction-id uint))
+    (map-get? HSATransactions transaction-id)
+)
+
+;; Calculate remaining contribution limit for current year
+(define-read-only (get-remaining-contribution-limit (account-holder principal))
+    (match (map-get? HSAAccounts account-holder)
+        hsa-account (let
+            (
+                (base-limit (var-get hsa-annual-contribution-limit))
+                (catch-up-limit (var-get hsa-catch-up-contribution-limit))
+                (total-limit (if (get is-catch-up-eligible hsa-account) 
+                    (+ base-limit catch-up-limit) 
+                    base-limit))
+                (current-contributions (get annual-contributions hsa-account))
+            )
+            (some (- total-limit current-contributions))
+        )
         none
     )
 )
 
-;; Check if claim can be appealed
-(define-read-only (can-appeal-claim (claim-id uint))
-    (match (map-get? Claims claim-id)
-        claim (let
-            (
-                (current-time stacks-block-height)
-                (appeal-deadline (+ (get date claim) (var-get appeal-deadline-blocks)))
-            )
-            (and
-                (is-eq (get status claim) "rejected")
-                (is-none (map-get? ClaimAppeals claim-id))
-                (<= current-time appeal-deadline)
-            )
-        )
-        false
-    )
+;; Check if HSA account exists
+(define-read-only (has-hsa-account (account-holder principal))
+    (is-some (map-get? HSAAccounts account-holder))
 )
 
-;; Get total appeals count
-(define-read-only (get-total-appeals)
-    (var-get total-appeals)
+;; Get total HSA accounts
+(define-read-only (get-total-hsa-accounts)
+    (var-get total-hsa-accounts)
 )
 
-;; Get appeal deadline in blocks
-(define-read-only (get-appeal-deadline-blocks)
-    (var-get appeal-deadline-blocks)
+;; Get HSA configuration
+(define-read-only (get-hsa-config)
+    {
+        annual-contribution-limit: (var-get hsa-annual-contribution-limit),
+        catch-up-contribution-limit: (var-get hsa-catch-up-contribution-limit),
+        annual-interest-rate: (var-get hsa-annual-interest-rate)
+    }
 )
 
-;; Update appeal deadline (only contract owner)
-(define-public (update-appeal-deadline (new-deadline uint))
+;; HSA Administrative Functions
+
+;; Update HSA contribution limits (only contract owner)
+(define-public (update-hsa-contribution-limits (new-annual-limit uint) (new-catch-up-limit uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
-        (asserts! (> new-deadline u0) ERR-INVALID-AMOUNT)
-        (var-set appeal-deadline-blocks new-deadline)
+        (asserts! (> new-annual-limit u0) ERR-INVALID-HSA-AMOUNT)
+        (asserts! (> new-catch-up-limit u0) ERR-INVALID-HSA-AMOUNT)
+        (var-set hsa-annual-contribution-limit new-annual-limit)
+        (var-set hsa-catch-up-contribution-limit new-catch-up-limit)
         (ok true)
     )
 )
 
-;; Get pending appeals count
-(define-read-only (get-pending-appeals-count)
-    (let
-        (
-            (total (var-get total-appeals))
-        )
-        (fold count-pending-appeals (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0)
+;; Update HSA interest rate (only contract owner)
+(define-public (update-hsa-interest-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-rate u10000) ERR-INVALID-HSA-AMOUNT)
+        (var-set hsa-annual-interest-rate new-rate)
+        (ok true)
     )
 )
 
-(define-private (count-pending-appeals (appeal-id uint) (acc uint))
-    (match (map-get? Appeals appeal-id)
-        appeal (if (is-eq (get status appeal) "pending") (+ acc u1) acc)
-        acc
-    )
-)
